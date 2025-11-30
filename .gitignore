@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# User-specific context (never commit)
+# These are created during /praxis:setup and contain personal data
+/user-context/
+
+# Backup files
+*.bak
+*.backup
+
+# Logs
+*.log
+
+# Node (if using for website)
+node_modules/
