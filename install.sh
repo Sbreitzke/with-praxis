@@ -38,7 +38,7 @@ if ! command -v claude &> /dev/null; then
 fi
 
 # Step 1: Create Praxis home directory
-echo -e "${BLUE}[1/4]${NC} Creating Praxis home directory..."
+echo -e "${BLUE}[1/5]${NC} Creating Praxis home directory..."
 if [ -d "$PRAXIS_HOME" ]; then
     echo -e "  ${YELLOW}Directory exists:${NC} $PRAXIS_HOME"
 else
@@ -50,7 +50,7 @@ mkdir -p "$PRAXIS_HOME/context"
 mkdir -p "$PRAXIS_HOME/patterns"
 
 # Step 2: Create Claude directory if needed
-echo -e "${BLUE}[2/4]${NC} Setting up Claude Code directory..."
+echo -e "${BLUE}[2/5]${NC} Setting up Claude Code directory..."
 if [ ! -d "$CLAUDE_DIR" ]; then
     mkdir -p "$CLAUDE_DIR"
     echo -e "  ${GREEN}Created:${NC} $CLAUDE_DIR"
@@ -62,7 +62,7 @@ mkdir -p "$CLAUDE_DIR/skills"
 mkdir -p "$CLAUDE_DIR/commands"
 
 # Step 3: Copy skills
-echo -e "${BLUE}[3/4]${NC} Installing skills..."
+echo -e "${BLUE}[3/5]${NC} Installing skills..."
 if [ -d "$SCRIPT_DIR/skills" ]; then
     cp -r "$SCRIPT_DIR/skills/"* "$CLAUDE_DIR/skills/" 2>/dev/null || true
     echo -e "  ${GREEN}Installed skills to:${NC} $CLAUDE_DIR/skills/"
@@ -71,12 +71,33 @@ else
 fi
 
 # Step 4: Copy commands
-echo -e "${BLUE}[4/4]${NC} Installing commands..."
+echo -e "${BLUE}[4/5]${NC} Installing commands..."
 if [ -d "$SCRIPT_DIR/commands" ]; then
     cp -r "$SCRIPT_DIR/commands/"* "$CLAUDE_DIR/commands/" 2>/dev/null || true
     echo -e "  ${GREEN}Installed commands to:${NC} $CLAUDE_DIR/commands/"
 else
     echo -e "  ${YELLOW}No commands to install${NC}"
+fi
+
+# Step 5: Install telemetry tool (self-improvement engine)
+echo -e "${BLUE}[5/5]${NC} Installing telemetry tool..."
+mkdir -p "$PRAXIS_HOME/tools"
+if [ -f "$SCRIPT_DIR/tools/telemetry" ]; then
+    cp "$SCRIPT_DIR/tools/telemetry" "$PRAXIS_HOME/tools/telemetry"
+    chmod +x "$PRAXIS_HOME/tools/telemetry"
+    echo -e "  ${GREEN}Installed:${NC} $PRAXIS_HOME/tools/telemetry"
+
+    # Initialize telemetry database
+    "$PRAXIS_HOME/tools/telemetry" init 2>/dev/null || true
+    echo -e "  ${GREEN}Initialized:${NC} Telemetry database"
+
+    # Add to PATH hint
+    if [[ ":$PATH:" != *":$PRAXIS_HOME/tools:"* ]]; then
+        echo -e "  ${YELLOW}Tip:${NC} Add to your shell config:"
+        echo -e "       export PATH=\"\$HOME/praxis/tools:\$PATH\""
+    fi
+else
+    echo -e "  ${YELLOW}No telemetry tool to install${NC}"
 fi
 
 # Copy initial CLAUDE.md if it doesn't exist

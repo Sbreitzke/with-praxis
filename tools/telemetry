@@ -1,0 +1,557 @@
+#!/bin/bash
+#
+# Praxis Telemetry CLI
+# Enforces structured logging to SQLite - no creative interpretation possible
+#
+# Usage:
+#   telemetry skill <name> <trigger> <summary>
+#   telemetry feedback <skill> <type> <text>
+#   telemetry resolve <feedback_id> <solution> [--iterations=N]
+#   telemetry lesson <feedback_id> <root_cause> <lesson> <action>
+#   telemetry pending                              # Show unresolved feedback
+#   telemetry snapshot <trigger> <json_file>
+#   telemetry query <sql>
+#   telemetry report [days]
+#   telemetry init
+#
+
+set -e
+
+DB_PATH="${PRAXIS_DB:-$HOME/.praxis/praxis.db}"
+SCRIPT_NAME=$(basename "$0")
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+error() {
+    echo -e "${RED}ERROR:${NC} $1" >&2
+    exit 1
+}
+
+success() {
+    echo -e "${GREEN}OK:${NC} $1"
+}
+
+warn() {
+    echo -e "${YELLOW}WARN:${NC} $1"
+}
+
+# Validate skill name - must be lowercase, alphanumeric, hyphens only
+validate_skill() {
+    local skill="$1"
+    if [[ ! "$skill" =~ ^[a-z0-9-]+$ ]]; then
+        error "Invalid skill name '$skill'. Must be lowercase alphanumeric with hyphens only."
+    fi
+
+    # Known skills - dynamically detected from ~/.claude/skills/
+    local skills_dir="$HOME/.claude/skills"
+    if [[ -d "$skills_dir" ]]; then
+        local known_skills=$(ls -1 "$skills_dir" 2>/dev/null | tr '\n' ' ')
+        if [[ -n "$known_skills" ]] && [[ ! " $known_skills " =~ " $skill " ]]; then
+            warn "Unknown skill '$skill'. Known: $known_skills"
+        fi
+    fi
+    # Note: Unknown skills still logged - warning is informational
+}
+
+# Validate trigger reason - must be one of predefined values
+validate_trigger() {
+    local trigger="$1"
+    local valid_triggers="user-request auto-detect command explicit-invoke"
+
+    if [[ ! " $valid_triggers " =~ " $trigger " ]]; then
+        error "Invalid trigger '$trigger'. Must be one of: $valid_triggers"
+    fi
+}
+
+# Validate feedback type
+validate_feedback_type() {
+    local ftype="$1"
+    local valid_types="correction criticism praise suggestion"
+
+    if [[ ! " $valid_types " =~ " $ftype " ]]; then
+        error "Invalid feedback type '$ftype'. Must be one of: $valid_types"
+    fi
+}
+
+# Escape single quotes for SQLite
+escape_sql() {
+    echo "$1" | sed "s/'/''/g"
+}
+
+# Generate session ID (date-based, changes daily)
+get_session_id() {
+    echo "session-$(date +%Y%m%d)-$$"
+}
+
+# Initialize database
+cmd_init() {
+    if [[ -f "$DB_PATH" ]]; then
+        warn "Database already exists at $DB_PATH"
+        read -p "Reinitialize? This will DELETE all data. (y/N) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo "Aborted."
+            exit 0
+        fi
+        rm "$DB_PATH"
+    fi
+
+    sqlite3 "$DB_PATH" <<'EOF'
+-- Skill activations
+CREATE TABLE skill_activations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT DEFAULT (datetime('now', 'localtime')),
+    skill TEXT NOT NULL,
+    trigger_reason TEXT NOT NULL,
+    task_summary TEXT,
+    session_id TEXT,
+    CHECK (trigger_reason IN ('user-request', 'auto-detect', 'command', 'explicit-invoke'))
+);
+
+-- Feedback/corrections
+CREATE TABLE skill_feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT DEFAULT (datetime('now', 'localtime')),
+    skill TEXT NOT NULL,
+    feedback_type TEXT NOT NULL,
+    feedback_text TEXT,
+    session_id TEXT,
+    CHECK (feedback_type IN ('correction', 'criticism', 'praise', 'suggestion'))
+);
+
+-- Conversation snapshots (on demand)
+CREATE TABLE conversation_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT DEFAULT (datetime('now', 'localtime')),
+    session_id TEXT,
+    trigger TEXT,
+    snapshot_json TEXT
+);
+
+-- Feedback resolutions (when feedback is addressed)
+CREATE TABLE feedback_resolutions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT DEFAULT (datetime('now', 'localtime')),
+    feedback_id INTEGER NOT NULL,
+    solution_summary TEXT NOT NULL,
+    iterations INTEGER DEFAULT 1,
+    FOREIGN KEY (feedback_id) REFERENCES skill_feedback(id)
+);
+
+-- Lessons learned (insights from resolved feedback)
+CREATE TABLE lessons_learned (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT DEFAULT (datetime('now', 'localtime')),
+    feedback_id INTEGER NOT NULL,
+    root_cause TEXT NOT NULL,
+    lesson TEXT NOT NULL,
+    action TEXT NOT NULL,
+    action_completed INTEGER DEFAULT 0,
+    CHECK (action IN ('update-skill', 'update-context', 'update-command', 'none')),
+    FOREIGN KEY (feedback_id) REFERENCES skill_feedback(id)
+);
+
+-- Indexes for common queries
+CREATE INDEX idx_activations_skill ON skill_activations(skill);
+CREATE INDEX idx_activations_timestamp ON skill_activations(timestamp);
+CREATE INDEX idx_feedback_skill ON skill_feedback(skill);
+CREATE INDEX idx_feedback_type ON skill_feedback(feedback_type);
+CREATE INDEX idx_resolutions_feedback ON feedback_resolutions(feedback_id);
+CREATE INDEX idx_lessons_feedback ON lessons_learned(feedback_id);
+
+-- Meta table for schema version
+CREATE TABLE _meta (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+INSERT INTO _meta (key, value) VALUES ('schema_version', '2');
+INSERT INTO _meta (key, value) VALUES ('created_at', datetime('now', 'localtime'));
+EOF
+
+    success "Database initialized at $DB_PATH"
+}
+
+# Log skill activation
+cmd_skill() {
+    if [[ $# -lt 3 ]]; then
+        error "Usage: $SCRIPT_NAME skill <name> <trigger> <summary>"
+    fi
+
+    local skill="$1"
+    local trigger="$2"
+    local summary="$3"
+    local session_id=$(get_session_id)
+
+    validate_skill "$skill"
+    validate_trigger "$trigger"
+
+    if [[ -z "$summary" ]]; then
+        error "Summary cannot be empty"
+    fi
+
+    if [[ ${#summary} -gt 500 ]]; then
+        error "Summary too long (max 500 chars, got ${#summary})"
+    fi
+
+    local escaped_summary=$(escape_sql "$summary")
+
+    sqlite3 "$DB_PATH" "INSERT INTO skill_activations (skill, trigger_reason, task_summary, session_id) VALUES ('$skill', '$trigger', '$escaped_summary', '$session_id');"
+
+    success "Logged: $skill ($trigger)"
+}
+
+# Log feedback
+cmd_feedback() {
+    if [[ $# -lt 3 ]]; then
+        error "Usage: $SCRIPT_NAME feedback <skill> <type> <text>"
+    fi
+
+    local skill="$1"
+    local ftype="$2"
+    local text="$3"
+    local session_id=$(get_session_id)
+
+    validate_skill "$skill"
+    validate_feedback_type "$ftype"
+
+    if [[ -z "$text" ]]; then
+        error "Feedback text cannot be empty"
+    fi
+
+    local escaped_text=$(escape_sql "$text")
+
+    sqlite3 "$DB_PATH" "INSERT INTO skill_feedback (skill, feedback_type, feedback_text, session_id) VALUES ('$skill', '$ftype', '$escaped_text', '$session_id');"
+
+    success "Feedback logged for: $skill ($ftype)"
+}
+
+# Resolve feedback (mark as addressed)
+cmd_resolve() {
+    if [[ $# -lt 2 ]]; then
+        error "Usage: $SCRIPT_NAME resolve <feedback_id> <solution> [--iterations=N]"
+    fi
+
+    local feedback_id="$1"
+    local solution="$2"
+    local iterations=1
+
+    # Parse --iterations flag
+    for arg in "$@"; do
+        if [[ "$arg" =~ ^--iterations=([0-9]+)$ ]]; then
+            iterations="${BASH_REMATCH[1]}"
+        fi
+    done
+
+    # Verify feedback exists
+    local exists=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM skill_feedback WHERE id = $feedback_id;")
+    if [[ "$exists" -eq 0 ]]; then
+        error "Feedback ID $feedback_id not found"
+    fi
+
+    # Check if already resolved
+    local already_resolved=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM feedback_resolutions WHERE feedback_id = $feedback_id;")
+    if [[ "$already_resolved" -gt 0 ]]; then
+        warn "Feedback $feedback_id already resolved. Adding another resolution."
+    fi
+
+    local escaped_solution=$(escape_sql "$solution")
+
+    sqlite3 "$DB_PATH" "INSERT INTO feedback_resolutions (feedback_id, solution_summary, iterations) VALUES ($feedback_id, '$escaped_solution', $iterations);"
+
+    success "Feedback #$feedback_id resolved ($iterations iteration(s))"
+
+    # Return feedback_id for chaining
+    echo "FEEDBACK_ID=$feedback_id"
+}
+
+# Log lesson learned
+cmd_lesson() {
+    if [[ $# -lt 4 ]]; then
+        error "Usage: $SCRIPT_NAME lesson <feedback_id> <root_cause> <lesson> <action>"
+    fi
+
+    local feedback_id="$1"
+    local root_cause="$2"
+    local lesson="$3"
+    local action="$4"
+
+    # Validate action
+    local valid_actions="update-skill update-context update-command none"
+    if [[ ! " $valid_actions " =~ " $action " ]]; then
+        error "Invalid action '$action'. Must be one of: $valid_actions"
+    fi
+
+    # Verify feedback exists
+    local exists=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM skill_feedback WHERE id = $feedback_id;")
+    if [[ "$exists" -eq 0 ]]; then
+        error "Feedback ID $feedback_id not found"
+    fi
+
+    local escaped_root=$(escape_sql "$root_cause")
+    local escaped_lesson=$(escape_sql "$lesson")
+
+    sqlite3 "$DB_PATH" "INSERT INTO lessons_learned (feedback_id, root_cause, lesson, action) VALUES ($feedback_id, '$escaped_root', '$escaped_lesson', '$action');"
+
+    success "Lesson logged for feedback #$feedback_id (action: $action)"
+}
+
+# Mark lesson action as completed
+cmd_complete() {
+    if [[ $# -lt 1 ]]; then
+        error "Usage: $SCRIPT_NAME complete <lesson_id>"
+    fi
+
+    local lesson_id="$1"
+
+    # Verify lesson exists
+    local exists=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM lessons_learned WHERE id = $lesson_id;")
+    if [[ "$exists" -eq 0 ]]; then
+        error "Lesson ID $lesson_id not found"
+    fi
+
+    # Check if already completed
+    local already=$(sqlite3 "$DB_PATH" "SELECT action_completed FROM lessons_learned WHERE id = $lesson_id;")
+    if [[ "$already" -eq 1 ]]; then
+        warn "Lesson #$lesson_id already marked as completed"
+        return 0
+    fi
+
+    sqlite3 "$DB_PATH" "UPDATE lessons_learned SET action_completed = 1 WHERE id = $lesson_id;"
+
+    # Show what was completed
+    local info=$(sqlite3 -separator " | " "$DB_PATH" "
+        SELECT f.skill, l.action, substr(l.lesson, 1, 50)
+        FROM lessons_learned l
+        JOIN skill_feedback f ON l.feedback_id = f.id
+        WHERE l.id = $lesson_id;
+    ")
+
+    success "Action completed: $info"
+}
+
+# Show pending (unresolved) feedback
+cmd_pending() {
+    echo "=== Unresolved Feedback ==="
+    echo ""
+
+    sqlite3 -header -column "$DB_PATH" "
+        SELECT
+            f.id,
+            date(f.timestamp) as date,
+            f.skill,
+            f.feedback_type as type,
+            substr(f.feedback_text, 1, 50) as preview
+        FROM skill_feedback f
+        LEFT JOIN feedback_resolutions r ON f.id = r.feedback_id
+        WHERE r.id IS NULL
+        ORDER BY f.timestamp DESC;
+    "
+
+    local count=$(sqlite3 "$DB_PATH" "
+        SELECT COUNT(*)
+        FROM skill_feedback f
+        LEFT JOIN feedback_resolutions r ON f.id = r.feedback_id
+        WHERE r.id IS NULL;
+    ")
+
+    echo ""
+    echo "Total unresolved: $count"
+}
+
+# Save conversation snapshot
+cmd_snapshot() {
+    if [[ $# -lt 2 ]]; then
+        error "Usage: $SCRIPT_NAME snapshot <trigger> <json_file>"
+    fi
+
+    local trigger="$1"
+    local json_file="$2"
+    local session_id=$(get_session_id)
+
+    if [[ ! -f "$json_file" ]]; then
+        error "JSON file not found: $json_file"
+    fi
+
+    local json_content=$(cat "$json_file" | tr '\n' ' ' | sed "s/'/''/g")
+
+    sqlite3 "$DB_PATH" "INSERT INTO conversation_snapshots (session_id, trigger, snapshot_json) VALUES ('$session_id', '$trigger', '$json_content');"
+
+    success "Snapshot saved ($trigger)"
+}
+
+# Run arbitrary query (for debugging/exploration)
+cmd_query() {
+    if [[ $# -lt 1 ]]; then
+        error "Usage: $SCRIPT_NAME query <sql>"
+    fi
+
+    sqlite3 -header -column "$DB_PATH" "$1"
+}
+
+# Generate usage report
+cmd_report() {
+    local days="${1:-30}"
+
+    echo "=== Praxis Telemetry Report (last $days days) ==="
+    echo ""
+
+    echo "## Skill Usage"
+    sqlite3 -header -column "$DB_PATH" "
+        SELECT
+            skill,
+            COUNT(*) as activations,
+            COUNT(DISTINCT date(timestamp)) as active_days
+        FROM skill_activations
+        WHERE timestamp > datetime('now', '-$days days')
+        GROUP BY skill
+        ORDER BY activations DESC;
+    "
+
+    echo ""
+    echo "## Trigger Distribution"
+    sqlite3 -header -column "$DB_PATH" "
+        SELECT
+            trigger_reason,
+            COUNT(*) as count,
+            ROUND(COUNT(*) * 100.0 / (SELECT COUNT(*) FROM skill_activations WHERE timestamp > datetime('now', '-$days days')), 1) as pct
+        FROM skill_activations
+        WHERE timestamp > datetime('now', '-$days days')
+        GROUP BY trigger_reason
+        ORDER BY count DESC;
+    "
+
+    echo ""
+    echo "## Feedback Summary"
+    sqlite3 -header -column "$DB_PATH" "
+        SELECT
+            skill,
+            feedback_type,
+            COUNT(*) as count
+        FROM skill_feedback
+        WHERE timestamp > datetime('now', '-$days days')
+        GROUP BY skill, feedback_type
+        ORDER BY count DESC;
+    "
+
+    echo ""
+    echo "## Recent Corrections (last 10)"
+    sqlite3 -header -column "$DB_PATH" "
+        SELECT
+            date(timestamp) as date,
+            skill,
+            substr(feedback_text, 1, 60) as feedback_preview
+        FROM skill_feedback
+        WHERE feedback_type = 'correction'
+        ORDER BY timestamp DESC
+        LIMIT 10;
+    "
+
+    echo ""
+    echo "## Lessons Learned"
+    sqlite3 -header -column "$DB_PATH" "
+        SELECT
+            date(l.timestamp) as date,
+            f.skill,
+            l.root_cause,
+            substr(l.lesson, 1, 40) as lesson_preview,
+            l.action,
+            CASE WHEN l.action_completed THEN '✓' ELSE '○' END as done
+        FROM lessons_learned l
+        JOIN skill_feedback f ON l.feedback_id = f.id
+        WHERE l.timestamp > datetime('now', '-$days days')
+        ORDER BY l.timestamp DESC
+        LIMIT 10;
+    "
+
+    echo ""
+    echo "## Pending Actions"
+    sqlite3 -header -column "$DB_PATH" "
+        SELECT
+            l.id,
+            f.skill,
+            l.action,
+            substr(l.lesson, 1, 50) as lesson_preview
+        FROM lessons_learned l
+        JOIN skill_feedback f ON l.feedback_id = f.id
+        WHERE l.action != 'none' AND l.action_completed = 0
+        ORDER BY l.timestamp DESC;
+    "
+
+    echo ""
+    echo "## Skills Never Used"
+    echo "(Compare against known skills list)"
+    sqlite3 "$DB_PATH" "
+        SELECT DISTINCT skill FROM skill_activations;
+    " | sort
+}
+
+# Show help
+cmd_help() {
+    cat <<EOF
+Praxis Telemetry CLI
+
+Usage: $SCRIPT_NAME <command> [args]
+
+Commands:
+  init                          Initialize database (creates ~/.praxis/praxis.db)
+  skill <name> <trigger> <sum>  Log skill activation
+  feedback <skill> <type> <txt> Log feedback/correction (returns ID)
+  resolve <id> <solution>       Mark feedback as resolved [--iterations=N]
+  lesson <id> <cause> <lesson> <action>  Log lesson learned
+  complete <lesson_id>          Mark lesson action as done
+  pending                       Show unresolved feedback
+  snapshot <trigger> <file>     Save conversation snapshot
+  query <sql>                   Run arbitrary SQL query
+  report [days]                 Generate usage report (default: 30 days)
+  help                          Show this help
+
+Skill names: lowercase, alphanumeric, hyphens (e.g., 'senior-dev', 'research')
+Triggers: user-request, auto-detect, command, explicit-invoke
+Feedback types: correction, criticism, praise, suggestion
+Actions: update-skill, update-context, update-command, none
+
+Examples:
+  $SCRIPT_NAME init
+  $SCRIPT_NAME skill research user-request "Market analysis for course pricing"
+  $SCRIPT_NAME feedback research correction "Should have checked competitor X"
+  $SCRIPT_NAME resolve 42 "Added competitor analysis section" --iterations=2
+  $SCRIPT_NAME lesson 42 "skill-instruction" "Add competitor check to research skill" "update-skill"
+  $SCRIPT_NAME pending
+  $SCRIPT_NAME report 7
+
+Environment:
+  PRAXIS_DB    Override database path (default: ~/.praxis/praxis.db)
+EOF
+}
+
+# Main dispatch
+main() {
+    local cmd="${1:-help}"
+    shift || true
+
+    # Check DB exists for commands that need it
+    if [[ "$cmd" != "init" && "$cmd" != "help" && ! -f "$DB_PATH" ]]; then
+        error "Database not found. Run '$SCRIPT_NAME init' first."
+    fi
+
+    case "$cmd" in
+        init)     cmd_init "$@" ;;
+        skill)    cmd_skill "$@" ;;
+        feedback) cmd_feedback "$@" ;;
+        resolve)  cmd_resolve "$@" ;;
+        lesson)   cmd_lesson "$@" ;;
+        complete) cmd_complete "$@" ;;
+        pending)  cmd_pending "$@" ;;
+        snapshot) cmd_snapshot "$@" ;;
+        query)    cmd_query "$@" ;;
+        report)   cmd_report "$@" ;;
+        help|--help|-h) cmd_help ;;
+        *)        error "Unknown command: $cmd. Run '$SCRIPT_NAME help' for usage." ;;
+    esac
+}
+
+main "$@"
